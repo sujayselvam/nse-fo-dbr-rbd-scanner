@@ -1,176 +1,322 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="NSE F&O DBR / RBD Scanner", page_icon="📊", layout="wide")
-st.title("NSE F&O — DBR / RBD Supply & Demand Scanner")
-st.caption("Daily timeframe • 180-calendar-day fresh-zone search • Free-data prototype")
+st.set_page_config(
+    page_title="NSE F&O DBR / RBD Scanner",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("NSE F&O – DBR / RBD Supply & Demand Scanner")
+st.caption("Daily candles | Strict experimental pattern detection | Historical fresh zones")
 
 UNIVERSE_FILE = Path("fo_universe.csv")
 
-@st.cache_data(ttl=3600, show_spinner=False)
+
+@st.cache_data(ttl=3600)
 def load_universe():
     if not UNIVERSE_FILE.exists():
         return []
+
     df = pd.read_csv(UNIVERSE_FILE)
     col = "symbol" if "symbol" in df.columns else df.columns[0]
-    vals = df[col].dropna().astype(str).str.strip().str.upper().tolist()
-    return sorted(set(v if v.endswith(".NS") else v + ".NS" for v in vals if v and v.lower() != "nan"))
 
-def download_history(symbols, period="1y"):
-    # Yahoo Finance is an unofficial free source, not an NSE-authorised feed.
-    raw = yf.download(
-        tickers=symbols, period=period, interval="1d",
-        group_by="ticker", auto_adjust=False, progress=False,
-        threads=True, timeout=25
+    symbols = df[col].dropna().astype(str).str.strip().str.upper()
+    symbols = [
+        s if s.endswith(".NS") else s + ".NS"
+        for s in symbols if s and s.lower() != "nan"
+    ]
+    return sorted(set(symbols))
+
+
+def get_history(symbol):
+    try:
+        df = yf.download(
+            symbol,
+            period="1y",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False
+        )
+
+        if df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        required = ["Open", "High", "Low", "Close"]
+        if not all(c in df.columns for c in required):
+            return None
+
+        df = df[required].dropna().copy()
+        return df
+
+    except Exception:
+        return None
+
+
+def detect_zones(df, symbol, lookback_days=180):
+    results = []
+
+    if df is None or len(df) < 30:
+        return results
+
+    df = df.copy()
+
+    df["ATR"] = (
+        pd.concat([
+            df["High"] - df["Low"],
+            (df["High"] - df["Close"].shift()).abs(),
+            (df["Low"] - df["Close"].shift()).abs()
+        ], axis=1).max(axis=1).rolling(14).mean()
     )
-    out = {}
-    if raw is None or raw.empty:
-        return out
-    if isinstance(raw.columns, pd.MultiIndex):
-        for sym in symbols:
-            if sym in raw.columns.get_level_values(0):
-                d = raw[sym].copy()
-                d = d.dropna(subset=["Open","High","Low","Close"])
-                if not d.empty: out[sym] = d
-    else:
-        sym = symbols[0]
-        d = raw.dropna(subset=["Open","High","Low","Close"])
-        if not d.empty: out[sym] = d
-    return out
 
-def atr_series(df, n=14):
-    prev = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev).abs(),
-        (df["Low"] - prev).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(n, min_periods=n).mean()
+    df = df.dropna(subset=["ATR"])
+    if len(df) < 10:
+        return results
 
-def detect_zones(symbol, df, days=180, max_base=3):
-    d = df.copy().dropna(subset=["Open","High","Low","Close"])
-    d["ATR"] = atr_series(d)
-    if len(d) < 25: return []
-    cutoff = pd.Timestamp.now(tz=None).normalize() - pd.Timedelta(days=days)
-    rows = []
-    # Pattern: one strong impulse into base, 1..3 compact base candles,
-    # then one strong departure candle breaking the base.
-    for base_n in range(1, max_base + 1):
-        for dep_i in range(15, len(d)):
-            base_end = dep_i - 1
-            base_start = base_end - base_n + 1
-            impulse_i = base_start - 1
-            if impulse_i < 14: continue
-            imp = d.iloc[impulse_i]
-            dep = d.iloc[dep_i]
-            base = d.iloc[base_start:base_end+1]
-            atr = d.iloc[dep_i]["ATR"]
-            if pd.isna(atr) or atr <= 0: continue
-            base_height = float(base["High"].max() - base["Low"].min())
-            compact = ((base["High"] - base["Low"]) <= 0.7 * atr).all() and base_height <= 1.5 * atr
-            if not compact: continue
-            imp_body = abs(float(imp["Close"] - imp["Open"]))
-            dep_body = abs(float(dep["Close"] - dep["Open"]))
-            if imp_body < 0.8 * float(d.iloc[impulse_i]["ATR"] if not pd.isna(d.iloc[impulse_i]["ATR"]) else atr): continue
-            if dep_body < 0.8 * atr: continue
+    cutoff = df.index[-1] - pd.Timedelta(days=lookback_days)
 
-            # Drop-Base-Rally: bearish impulse, bullish departure, close above base high.
-            # Rally-Base-Drop: bullish impulse, bearish departure, close below base low.
-            pattern = None
-            proximal = distal = None
-            if imp["Close"] < imp["Open"] and dep["Close"] > dep["Open"] and dep["Close"] > base["High"].max():
+    for i in range(4, len(df) - 1):
+
+        atr = float(df["ATR"].iloc[i])
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+
+        for base_len in (1, 2, 3):
+
+            start = i
+            end = i + base_len - 1
+            departure = end + 1
+
+            if departure >= len(df):
+                continue
+
+            base = df.iloc[start:end + 1]
+            before = df.iloc[i - 3:i]
+            move = df.iloc[departure]
+
+            base_high = float(base["High"].max())
+            base_low = float(base["Low"].min())
+            base_range = base_high - base_low
+
+            # Compact base requirement
+            if base_range > 1.5 * atr:
+                continue
+
+            if (base["High"] - base["Low"] > 0.7 * atr).any():
+                continue
+
+            # Prior directional impulse
+            prior_change = (
+                float(df["Close"].iloc[i - 1])
+                - float(df["Close"].iloc[i - 3])
+            )
+
+            body = abs(float(move["Close"]) - float(move["Open"]))
+
+            # DBR: Drop, Base, Rally
+            if (
+                prior_change <= -1.0 * atr
+                and move["Close"] > move["Open"]
+                and body >= 0.8 * atr
+                and move["Close"] > base_high
+            ):
                 pattern = "DBR"
-                proximal = float(np.maximum(base["Open"], base["Close"]).max())
-                distal = float(base["Low"].min())
-            elif imp["Close"] > imp["Open"] and dep["Close"] < dep["Open"] and dep["Close"] < base["Low"].min():
-                pattern = "RBD"
-                proximal = float(np.minimum(base["Open"], base["Close"]).min())
-                distal = float(base["High"].max())
-            if not pattern: continue
+                proximal = float(
+                    base[["Open", "Close"]].max(axis=1).max()
+                )
+                distal = base_low
 
-            formation_date = pd.Timestamp(d.index[dep_i]).tz_localize(None) if getattr(d.index[dep_i], "tzinfo", None) else pd.Timestamp(d.index[dep_i])
-            if formation_date < cutoff: continue
-            # A later candle has mitigated the zone if its range intersects the zone.
-            later = d.iloc[dep_i+1:]
-            if pattern == "DBR":
-                touched = bool(((later["Low"] <= proximal) & (later["High"] >= distal)).any())
-                invalid = bool((later["Close"] < distal).any())
+            # RBD: Rally, Base, Drop
+            elif (
+                prior_change >= 1.0 * atr
+                and move["Close"] < move["Open"]
+                and body >= 0.8 * atr
+                and move["Close"] < base_low
+            ):
+                pattern = "RBD"
+                proximal = float(
+                    base[["Open", "Close"]].min(axis=1).min()
+                )
+                distal = base_high
+
             else:
-                touched = bool(((later["High"] >= proximal) & (later["Low"] <= distal)).any())
-                invalid = bool((later["Close"] > distal).any())
-            status = "Invalidated" if invalid else ("Touched" if touched else "Fresh")
-            rows.append({
-                "Symbol": symbol.replace(".NS",""),
+                continue
+
+            formation_date = df.index[departure]
+
+            if formation_date < cutoff:
+                continue
+
+            # Check every candle after departure
+            future = df.iloc[departure + 1:]
+
+            status = "Fresh"
+
+            if pattern == "DBR":
+                for _, candle in future.iterrows():
+                    if candle["Low"] < distal:
+                        status = "Invalidated"
+                        break
+                    if candle["Low"] <= proximal:
+                        status = "Tested"
+
+            else:
+                for _, candle in future.iterrows():
+                    if candle["High"] > distal:
+                        status = "Invalidated"
+                        break
+                    if candle["High"] >= proximal:
+                        status = "Tested"
+
+            latest_close = float(df["Close"].iloc[-1])
+            age = (df.index[-1] - formation_date).days
+
+            results.append({
+                "Symbol": symbol.replace(".NS", ""),
                 "Pattern": pattern,
-                "Formation date": formation_date.date().isoformat(),
+                "Formation Date": formation_date.strftime("%Y-%m-%d"),
                 "Proximal": round(proximal, 2),
                 "Distal": round(distal, 2),
-                "Latest close": round(float(d["Close"].iloc[-1]), 2),
+                "Latest Close": round(latest_close, 2),
                 "Status": status,
-                "Age (calendar days)": (pd.Timestamp.now().normalize() - formation_date.normalize()).days
+                "Age (days)": age
             })
-    # Deduplicate identical pattern/date/zone rows
-    unique = {}
-    for r in rows:
-        k = (r["Symbol"], r["Pattern"], r["Formation date"], r["Proximal"], r["Distal"])
-        unique[k] = r
-    return list(unique.values())
 
-st.info("Data source: Yahoo Finance daily candles (free, unofficial). Verify prices against Dhan/NSE before trading. This is a research scanner, not investment advice.")
+            # Avoid duplicate base lengths at the same departure
+            break
+
+    return results
+
+
+# Dashboard controls
 symbols = load_universe()
+
+st.sidebar.header("Scanner Settings")
+
+lookback = st.sidebar.selectbox(
+    "Historical window",
+    [90, 180, 270, 365],
+    index=1
+)
+
+st.sidebar.write(f"Stocks in universe: {len(symbols)}")
+
 if not symbols:
-    st.error("No symbols found. Add NSE symbols (one per row) to fo_universe.csv, without .NS suffix.")
-    st.stop()
+    st.error("No stock symbols found in fo_universe.csv")
 
-with st.sidebar:
-    st.header("Scanner settings")
-    days = st.selectbox("Historical fresh-zone window", [180], index=0)
-    base_n = st.selectbox("Maximum base candles", [1,2,3], index=2)
-    st.caption(f"Universe file: {len(symbols)} symbols")
-    run = st.button("Run scan now", type="primary", use_container_width=True)
+if st.button("🔍 Run Scan Now", type="primary"):
+    if not symbols:
+        st.error("Please check fo_universe.csv")
+    else:
+        all_results = []
+        progress = st.progress(0)
+        message = st.empty()
 
-if run or "scan_results" not in st.session_state:
-    with st.spinner(f"Downloading daily candles and scanning {len(symbols)} symbols..."):
-        frames = download_history(symbols, period="1y")
-        found = []
-        errors = []
-        for sym in symbols:
-            df = frames.get(sym)
-            if df is None or df.empty:
-                errors.append(sym)
-                continue
-            found.extend(detect_zones(sym, df, days=days, max_base=base_n))
-        st.session_state["scan_results"] = pd.DataFrame(found)
-        st.session_state["scan_errors"] = errors
-        st.session_state["scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        for number, symbol in enumerate(symbols):
+            message.write(f"Scanning {symbol} ({number + 1}/{len(symbols)})")
 
-results = st.session_state["scan_results"]
-errors = st.session_state["scan_errors"]
-st.caption(f"Last scan: {st.session_state['scan_time']} • Symbols with data: {len(symbols)-len(errors)}/{len(symbols)}")
-if errors:
-    with st.expander(f"Symbols with missing data ({len(errors)})"):
-        st.write(", ".join(s.replace(".NS","") for s in errors))
+            history = get_history(symbol)
 
-if results.empty:
-    st.warning("No patterns detected in the downloaded data. This can be a valid result; it does not mean the scanner is broken.")
-else:
-    latest_dbr = results[results["Pattern"]=="DBR"].sort_values("Formation date", ascending=False)
-    latest_rbd = results[results["Pattern"]=="RBD"].sort_values("Formation date", ascending=False)
-    fresh = results[results["Status"]=="Fresh"].sort_values("Formation date", ascending=False)
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("DBR formations", len(latest_dbr))
-    c2.metric("RBD formations", len(latest_rbd))
-    c3.metric("Fresh zones", len(fresh))
-    c4.metric("Invalidated / touched", len(results)-len(fresh))
-    tabs = st.tabs(["Latest DBR","Latest RBD","Historical fresh zones","All detected zones"])
-    with tabs[0]: st.dataframe(latest_dbr, use_container_width=True, hide_index=True)
-    with tabs[1]: st.dataframe(latest_rbd, use_container_width=True, hide_index=True)
-    with tabs[2]: st.dataframe(fresh, use_container_width=True, hide_index=True)
-    with tabs[3]: st.dataframe(results.sort_values("Formation date", ascending=False), use_container_width=True, hide_index=True)
-    st.download_button("Download scan results CSV", results.to_csv(index=False), "dbr_rbd_scan.csv", "text/csv")
+            if history is not None:
+                all_results.extend(
+                    detect_zones(history, symbol, lookback)
+                )
 
-st.caption("Pattern rules are explicit but still need validation against your preferred strict supply/demand interpretation. Corporate-action adjustments and data-provider gaps can affect zones.")
+            progress.progress((number + 1) / len(symbols))
+
+        st.session_state["scan_results"] = pd.DataFrame(all_results)
+        st.session_state["scan_time"] = datetime.now().strftime(
+            "%d-%m-%Y %H:%M:%S"
+        )
+
+        message.success("Scan completed!")
+
+if "scan_results" in st.session_state:
+
+    results = st.session_state["scan_results"]
+
+    st.caption(
+        "Last scan: " + st.session_state.get("scan_time", "Unknown")
+    )
+
+    if results.empty:
+        st.warning("No qualifying patterns detected.")
+    else:
+        latest_dbr = results[results["Pattern"] == "DBR"]
+        latest_rbd = results[results["Pattern"] == "RBD"]
+
+        fresh = results[results["Status"] == "Fresh"]
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("DBR formations", len(latest_dbr))
+        col2.metric("RBD formations", len(latest_rbd))
+        col3.metric("Historical fresh zones", len(fresh))
+
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "Latest DBR",
+            "Latest RBD",
+            "Historical Fresh Zones",
+            "All Results"
+        ])
+
+        with tab1:
+            st.dataframe(
+                latest_dbr.sort_values(
+                    "Formation Date", ascending=False
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        with tab2:
+            st.dataframe(
+                latest_rbd.sort_values(
+                    "Formation Date", ascending=False
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        with tab3:
+            st.dataframe(
+                fresh.sort_values(
+                    "Formation Date", ascending=False
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        with tab4:
+            st.dataframe(
+                results.sort_values(
+                    "Formation Date", ascending=False
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        csv = results.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            "⬇ Download Scan Results CSV",
+            data=csv,
+            file_name="NSE_DBR_RBD_Scan.csv",
+            mime="text/csv"
+        )
+
+st.divider()
+
+st.caption(
+    "Data source: Yahoo Finance (unofficial). "
+    "Experimental pattern rules; verify all signals against actual charts. "
+    "This version does not perform automatic daily scans."
+)
